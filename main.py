@@ -30,22 +30,30 @@ async def upload_pdf(file: UploadFile = File(...)):
         
         print(f"--- Processing PDF: {file.filename} ---") 
 
-        # Define patterns ONCE at the start of the function
+        # Pattern to identify the START of a transaction line (a date at the beginning)
         start_of_transaction_pattern = re.compile(r"^\s*(\d{1,2}\s+\w+\s+\d{4})")
 
-        # UPDATED COMPREHENSIVE REGEX PATTERN (for concatenated lines)
+        # Main transaction line regex: designed to capture dates, a broad description part, and the two amounts at the end.
+        # This regex is made more flexible with whitespace.
         transaction_line_pattern = re.compile(
             r"^\s*" + # Start of line, optional leading space
-            r"(\d{1,2}\s+\w+\s+\d{4})" + # Group 1: Transaction Date
+            r"(\d{1,2}\s+\w+\s+\d{4})" + # Group 1: Transaction Date (e.g., "4 Mar 2025")
             r"\s+" +
-            r"(\d{1,2}\s+\w+\s+\d{4})" + # Group 2: Value Date
-            r"\s+(.+?)\s*-\s*" + # Group 3: Description (non-greedy, ends with "-")
-            r"(?:(\d{11}|\d{13})\s+)?" + # Group 4: Optional Ref No (11 or 13 digits), non-capturing group with optional capture group inside
-            r"([\d,]+\.\d{2})" + # Group 5: Single Transaction Amount (e.g., "10,000.00")
-            r"\s+([\d,]+\.\d{2}|\d[\d,]*)\s*$" # Group 6: Balance (e.g., "1,92,462" or "1,92,462.97")
+            r"(\d{1,2}\s+\w+\s+\d{4})" + # Group 2: Value Date (e.g., "4 Mar 2025")
+            r"\s*(.+?)" + # Group 3: Broad Description (non-greedy, captures everything until the amount patterns are found)
+            r"\s+" + # Separator before the first amount
+            r"([\d,]+\.\d{2}|-)" + # Group 4: First Amount (could be debit/credit). Made non-optional, assuming one will always be there.
+            r"\s+" + # Separator before the second amount
+            r"([\d,]+\.\d{2}|\d[\d,]*|-\s*)" + # Group 5: Second Amount (Balance or the other D/C value)
+            r"\s*$" # Optional trailing space and end of line
         )
 
-        # Function to safely parse amount strings to float (keep this local to upload_pdf if only used here)
+        # Secondary regex to find the Reference/Cheque Number within the broad description
+        # Looks for text ending in 11 or 13 digits. This will be applied in post-processing.
+        ref_cheque_no_pattern = re.compile(r'([A-Z0-9\s]*?(\d{11}|\d{13}))(?:\s*-|\s*$)', re.IGNORECASE) # Pattern to capture the ref_no and then check for - or end of string
+
+
+        # Function to safely parse amount strings to float
         def parse_amount(amount_str):
             if amount_str is None or amount_str.strip() == '' or amount_str.strip() == '-':
                 return 0.0
@@ -59,17 +67,20 @@ async def upload_pdf(file: UploadFile = File(...)):
             print("--- End Page Raw Text ---")
 
             if text:
-                # This is correct: lines from *this* page
                 all_lines_from_page = re.split(r'\r\n|\n|\r', text)
                 
                 current_transaction_lines = []
                 
-                for j, line in enumerate(all_lines_from_page): # Iterate through all_lines_from_page
+                for j, line in enumerate(all_lines_from_page):
                     line = line.strip()
                     if not line: # Skip empty lines
                         continue
 
-                    if start_of_transaction_pattern.search(line):
+                    # Determine if this line is the start of a new transaction.
+                    # It starts a new transaction if it has a date at the beginning.
+                    is_new_transaction_start = start_of_transaction_pattern.search(line)
+                    
+                    if is_new_transaction_start:
                         if current_transaction_lines:
                             combined_single_transaction_line = " ".join(current_transaction_lines)
                             print(f"Attempting to match combined line: '{combined_single_transaction_line}'")
@@ -81,49 +92,60 @@ async def upload_pdf(file: UploadFile = File(...)):
                                 print(f"Groups: {match.groups()}")
 
                                 trans_date_str = match.group(1)
-                                value_date_str = match.group(2) # Value date, captured but not used in UI
-                                description_raw = match.group(3)
-                                ref_no = match.group(4) # Ref no, captured but not used in UI
-                                transaction_amount_str = match.group(5) # The single debit or credit amount
-                                balance_str = match.group(6) # The balance
+                                value_date_str = match.group(2)
+                                description_and_ref_raw = match.group(3) # This now contains the description + potential ref no
+                                amount1_str = match.group(4) # First amount from right (Debit/Credit)
+                                amount2_str = match.group(5) # Second amount from right (Balance)
 
+                                # --- Date Parsing ---
                                 extracted_date = None
                                 try:
                                     extracted_date = datetime.strptime(trans_date_str, '%d %b %Y').strftime('%Y-%m-%d')
-                                except ValueError:
-                                    try:
-                                        extracted_date = datetime.strptime(trans_date_str, '%m/%d/%Y').strftime('%Y-%m-%d')
-                                    except ValueError:
-                                        try:
-                                            extracted_date = datetime.strptime(trans_date_str, '%d-%m-%Y').strftime('%Y-%m-%d')
-                                        except ValueError:
-                                            extracted_date = trans_date_str
+                                except ValueError: # Add more date formats here if needed based on the PDF
+                                    extracted_date = trans_date_str 
 
-                                description = description_raw.strip()
-                                description = re.sub(r'\s+', ' ', description).strip()
+                                # --- Extract Reference/Cheque Number & Clean Description ---
+                                final_description = description_and_ref_raw.strip()
+                                extracted_ref_no = ""
+                                
+                                ref_match = ref_cheque_no_pattern.search(final_description)
+                                if ref_match:
+                                    full_ref_text_to_remove = ref_match.group(1).strip()
+                                    extracted_ref_no = ref_match.group(2) # The 11 or 13 digit number itself
+                                    # Remove the extracted ref text from the description
+                                    final_description = final_description.replace(full_ref_text_to_remove, '').strip()
+                                
+                                # Remove any remaining hyphens from description (Rule: '-' indicates end of description)
+                                final_description = final_description.replace('-', '').strip()
+                                final_description = re.sub(r'\s+', ' ', final_description).strip() # Consolidate internal spaces
 
-                                transaction_amount = parse_amount(transaction_amount_str)
-                                balance = parse_amount(balance_str)
+
+                                # --- Amount Parsing & Debit/Credit Assignment ---
+                                # Rule: every line will have either a debit value or a credit value, both will never be present.
+                                # Amounts appear as [Debit/Credit Value] [Balance Value]
+                                amount1 = parse_amount(amount1_str)
+                                balance = parse_amount(amount2_str) # The last number is the balance
 
                                 debit = 0.0
                                 credit = 0.0
                                 
-                                description_upper = description.upper()
-
-                                if "DEBIT" in description_upper or "DR" in description_upper or "WITHDRAWAL" in description_upper or "SIP" in description_upper or "PMT" in description_upper:
-                                    debit = transaction_amount
+                                description_upper = final_description.upper()
+                                # Common indicators for debit
+                                if "DEBIT" in description_upper or "DR" in description_upper or "WITHDRAWAL" in description_upper or "SIP" in description_upper or "PMT" in description_upper or "PAYMENT" in description_upper:
+                                    debit = amount1
+                                # Common indicators for credit (or if no debit indicator found)
                                 elif "CREDIT" in description_upper or "CR" in description_upper or "TRANSFER-INB" in description_upper or "DEPOSIT" in description_upper or "BY TRANSFER" in description_upper:
-                                    credit = transaction_amount
+                                    credit = amount1
                                 else:
-                                    # Default: If no clear indicator, check if it's likely a credit based on general transaction type
-                                    # This is a heuristic. Adjust based on bank statement specifics.
-                                    # For example, if transaction_amount is positive and no debit keyword, assume credit.
-                                    credit = transaction_amount
+                                    # Default: If no clear indicator, and an amount is present, assume credit
+                                    # based on your sample "TRANSFER T10,000.00" being a credit.
+                                    credit = amount1
 
 
                                 transactions.append({
                                     "date": extracted_date,
-                                    "description": description if description else "No description extracted",
+                                    "description": final_description if final_description else "No description extracted",
+                                    "reference_no": extracted_ref_no, # Add reference number to the output
                                     "debit": debit,
                                     "credit": credit,
                                     "balance": balance,
@@ -136,7 +158,7 @@ async def upload_pdf(file: UploadFile = File(...)):
                     else:
                         current_transaction_lines.append(line)
                 
-                # After the loop, process any remaining accumulated lines (for the last transaction on the page)
+                # Process any remaining accumulated lines (for the last transaction on the page)
                 if current_transaction_lines:
                     combined_single_transaction_line = " ".join(current_transaction_lines)
                     print(f"Attempting to match final combined line: '{combined_single_transaction_line}'")
@@ -149,44 +171,47 @@ async def upload_pdf(file: UploadFile = File(...)):
 
                         trans_date_str = match.group(1)
                         value_date_str = match.group(2)
-                        description_raw = match.group(3)
-                        ref_no = match.group(4)
-                        transaction_amount_str = match.group(5)
-                        balance_str = match.group(6)
+                        description_and_ref_raw = match.group(3)
+                        amount1_str = match.group(4)
+                        amount2_str = match.group(5)
 
                         extracted_date = None
                         try:
                             extracted_date = datetime.strptime(trans_date_str, '%d %b %Y').strftime('%Y-%m-%d')
                         except ValueError:
-                            try:
-                                extracted_date = datetime.strptime(trans_date_str, '%m/%d/%Y').strftime('%Y-%m-%d')
-                            except ValueError:
-                                try:
-                                    extracted_date = datetime.strptime(trans_date_str, '%d-%m-%Y').strftime('%Y-%m-%d')
-                                except ValueError:
-                                    extracted_date = trans_date_str
+                            extracted_date = trans_date_str 
 
-                        description = description_raw.strip()
-                        description = re.sub(r'\s+', ' ', description).strip()
+                        final_description = description_and_ref_raw.strip()
+                        extracted_ref_no = ""
+                        
+                        ref_match = ref_cheque_no_pattern.search(final_description)
+                        if ref_match:
+                            full_ref_text_to_remove = ref_match.group(1).strip()
+                            extracted_ref_no = ref_match.group(2)
+                            final_description = final_description.replace(full_ref_text_to_remove, '').strip()
+                        
+                        final_description = final_description.replace('-', '').strip()
+                        final_description = re.sub(r'\s+', ' ', final_description).strip()
 
-                        transaction_amount = parse_amount(transaction_amount_str)
-                        balance = parse_amount(balance_str)
+                        amount1 = parse_amount(amount1_str)
+                        balance = parse_amount(amount2_str)
 
                         debit = 0.0
                         credit = 0.0
                         
-                        description_upper = description.upper()
-                        if "DEBIT" in description_upper or "DR" in description_upper or "WITHDRAWAL" in description_upper or "SIP" in description_upper or "PMT" in description_upper:
-                            debit = transaction_amount
+                        description_upper = final_description.upper()
+                        if "DEBIT" in description_upper or "DR" in description_upper or "WITHDRAWAL" in description_upper or "SIP" in description_upper or "PMT" in description_upper or "PAYMENT" in description_upper:
+                            debit = amount1
                         elif "CREDIT" in description_upper or "CR" in description_upper or "TRANSFER-INB" in description_upper or "DEPOSIT" in description_upper or "BY TRANSFER" in description_upper:
-                            credit = transaction_amount
+                            credit = amount1
                         else:
-                            credit = transaction_amount
+                            credit = amount1
 
 
                         transactions.append({
                             "date": extracted_date,
-                            "description": description if description else "No description extracted",
+                            "description": final_description if final_description else "No description extracted",
+                            "reference_no": extracted_ref_no,
                             "debit": debit,
                             "credit": credit,
                             "balance": balance,
@@ -226,7 +251,7 @@ async def save_category(payload: dict):
             with open(CATEGORIZATION_FILE, "r") as f:
                 content = f.read()
                 if content:
-                    try: # FIX START (corrected from try{cite:1})
+                    try:
                         memory = json.loads(content)
                     except json.JSONDecodeError:
                         print(f"Warning: {CATEGORIZATION_FILE} is corrupted or invalid JSON. Starting with empty memory.")
@@ -254,7 +279,7 @@ async def get_categories():
             with open(CATEGORIZATION_FILE, "r") as f:
                 content = f.read()
                 if content:
-                    try: # FIX START (corrected from try{cite:1})
+                    try:
                         memory = json.loads(content)
                     except json.JSONDecodeError:
                         print(f"Warning: {CATEGORIZATION_FILE} is corrupted or invalid JSON. Starting with empty memory.")
