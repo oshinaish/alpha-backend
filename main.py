@@ -6,7 +6,6 @@ import os
 import re
 from datetime import datetime
 
-
 app = FastAPI()
 
 app.add_middleware(
@@ -17,14 +16,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-
 CATEGORIZATION_FILE = "categorized_memory.json"
 
 @app.get("/")
 async def read_root():
     return {"message": "BahiKhata Backend API is running!"}
-
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -34,78 +30,91 @@ async def upload_pdf(file: UploadFile = File(...)):
         for page in reader.pages:
             text = page.extract_text()
             if text:
-                # Attempt to split text into lines, handling various line endings
                 lines = re.split(r'\r\n|\n|\r', text)
 
-                # Define common date patterns to look for.
-                # These are examples and might need to be expanded based on your PDFs.
-                # Pattern for DD Mon YYYY (e.g., 01 Jan 2023)
-                date_pattern_1 = r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})'
-                # Pattern for MM/DD/YYYY or DD/MM/YYYY
-                date_pattern_2 = r'(\d{1,2}/\d{1,2}/\d{4})'
-                # Pattern for YYYY-MM-DD
-                date_pattern_3 = r'(\d{4}-\d{1,2}-\d{1,2})'
+                # UPDATED COMPREHENSIVE REGEX PATTERN:
+                # This pattern assumes:
+                # 1. Start of line, then Transaction Date.
+                # 2. Followed by an optional Value Date (which we'll consume).
+                # 3. Then the Description, which can be multi-word and contain various chars.
+                # 4. Followed by TWO distinct amount columns (Debit and Credit), which might contain '0.00' or be empty/dash.
+                # 5. Finally, the Balance amount at the end of the line.
+                #
+                # Components:
+                # ^\s* : Start of line, optional leading whitespace
+                # (\d{1,2}\s+\w+\s+\d{4}) : Group 1: Transaction Date (e.g., "4 Mar 2025")
+                # \s+ : One or more spaces
+                # (?:\d{1,2}\s+\w+\s+\d{4})? : Non-capturing optional Group for Value Date (e.g., "4 Mar 2025"), consumes it.
+                # \s+ : One or more spaces
+                # (.+?) : Group 2: Description (NON-GREEDY, captures everything until the next pattern matches)
+                # \s{2,} : Two or more spaces (often separates description from amounts reliably)
+                # ([\d,]+\.\d{2}|-)? : Group 3: Debit Amount (e.g., "10,000.00" or "-"), optional.
+                # \s{2,} : Two or more spaces
+                # ([\d,]+\.\d{2}|-)? : Group 4: Credit Amount (e.g., "10,000.00" or "-"), optional.
+                # \s* : Optional spaces
+                # ([\d,]+\.\d{2}|\d[\d,]*|-\s*)?$ : Group 5: Balance (e.g., "1,92,462" or "100.00" or "-"), optional end of line.
+                #
+                # The assumption of '\s{2,}' (two or more spaces) separating the description from amounts, and amounts from each other,
+                # is critical. Adjust this if your actual PDFs use different consistent separators.
                 
-                # Combine date patterns
-                combined_date_pattern = re.compile(f"{date_pattern_1}|{date_pattern_2}|{date_pattern_3}", re.IGNORECASE)
+                transaction_line_pattern = re.compile(
+                    r"^\s*" + # Start of line, optional leading space
+                    r"(\d{1,2}\s+\w+\s+\d{4})" + # Group 1: Transaction Date
+                    r"\s+" +
+                    r"(?:\d{1,2}\s+\w+\s+\d{4})" + # Consume Value Date (not captured)
+                    r"\s+(.+?)" + # Group 2: Description (non-greedy, captures everything until the next pattern)
+                    r"\s{2,}" + # Assumed separator after description (2+ spaces)
+                    r"([\d,]+\.\d{2}|-)?" + # Group 3: Debit Amount (can be number or dash)
+                    r"\s{2,}" + # Assumed separator between Debit and Credit (2+ spaces)
+                    r"([\d,]+\.\d{2}|-)?\s*?" + # Group 4: Credit Amount (can be number or dash), non-greedy space
+                    r"([\d,]+\.\d{2}|\d[\d,]*|-\s*)?" + # Group 5: Balance (can be float, int with commas, or dash), optional
+                    r"\s*$" # Optional trailing space and end of line
+                )
 
-                # Keywords to identify a line as a potential transaction
-                transaction_keywords = ["DEBIT", "CREDIT", "TRANSFER", "IMPS", "NEFT", "PAYMENT", "PURCHASE", "SALE", "WITHDRAWAL", "DEPOSIT"]
+                # Function to safely parse amount strings to float
+                def parse_amount(amount_str):
+                    if amount_str is None or amount_str.strip() == '-' or amount_str.strip() == '':
+                        return 0.0
+                    return float(amount_str.replace(',', '')) # Remove commas for parsing
 
-                # Heuristic for full description and date extraction:
-                # We'll look for lines containing a date and a transaction keyword.
-                # Then, we'll try to extract the date and treat the rest as description.
-                for i, line in enumerate(lines):
+                for line in lines:
                     line = line.strip()
                     if not line:
                         continue
 
-                    # Check for keywords to narrow down transaction lines
-                    is_transaction_line = any(keyword in line.upper() for keyword in transaction_keywords)
-                    
-                    # Also look for presence of common numbers (amounts) to confirm it's a transaction
-                    contains_number = bool(re.search(r'\d{1,3}(?:,\d{3})*\.\d{2}|\d+', line))
+                    match = transaction_line_pattern.search(line)
 
-                    if is_transaction_line and contains_number:
-                        date_match = combined_date_pattern.search(line)
-                        
+                    if match:
+                        trans_date_str = match.group(1)
+                        description_raw = match.group(2)
+                        debit_str = match.group(3)
+                        credit_str = match.group(4)
+                        balance_str = match.group(5) # Note: Balance is now group 5
+
+                        # --- Date Parsing ---
                         extracted_date = None
-                        description = line # Start with full line as description
+                        try:
+                            extracted_date = datetime.strptime(trans_date_str, '%d %b %Y').strftime('%Y-%m-%d')
+                        except ValueError:
+                            extracted_date = trans_date_str # Fallback
 
-                        if date_match:
-                            # Use the matched date string (which ever group matched)
-                            date_str = next(g for g in date_match.groups() if g is not None)
-                            extracted_date = date_str
-                            
-                            # Remove the date part from the line to get a cleaner description
-                            description = line[date_match.end():].strip()
-
-                            # Attempt to parse date to YYYY-MM-DD for consistency
-                            try:
-                                # Try common formats for parsing
-                                if re.match(date_pattern_1, date_str, re.IGNORECASE):
-                                    extracted_date = datetime.strptime(date_str, '%d %b %Y').strftime('%Y-%m-%d')
-                                elif re.match(date_pattern_2.replace('\\', ''), date_str): # Need to remove regex special chars for direct match
-                                    try:
-                                        extracted_date = datetime.strptime(date_str, '%d/%m/%Y').strftime('%Y-%m-%d')
-                                    except ValueError: # Try MM/DD/YYYY
-                                        extracted_date = datetime.strptime(date_str, '%m/%d/%Y').strftime('%Y-%m-%d')
-                                elif re.match(date_pattern_3, date_str):
-                                    extracted_date = date_str # Already in YYYY-MM-DD
-                            except ValueError:
-                                # If parsing fails, keep original string or set to None
-                                extracted_date = date_str 
-
-                        # Further clean the description: remove common transaction types/amounts if they are still in description
-                        description = re.sub(r'\b(?:DEBIT|CREDIT|TRANSFER|IMPS|NEFT|DR|CR)\b', '', description, flags=re.IGNORECASE).strip()
-                        # Remove common currency symbols and large numbers at the end that might be amounts/balances
-                        description = re.sub(r'\b(?:INR|USD|EUR)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?\b', '', description).strip()
+                        # --- Description Cleaning ---
+                        # Keep it simple, as the regex now captures the exact span
+                        description = description_raw.strip()
                         description = re.sub(r'\s+', ' ', description).strip() # Replace multiple spaces with single
-                        
+
+                        # --- Amount Parsing ---
+                        debit = parse_amount(debit_str)
+                        credit = parse_amount(credit_str)
+                        balance = parse_amount(balance_str)
+
                         transactions.append({
                             "date": extracted_date,
                             "description": description if description else "No description extracted",
-                            "original_line": line # Keep original for debugging/fallback categorization key
+                            "debit": debit,
+                            "credit": credit,
+                            "balance": balance,
+                            "original_line": line # For debugging
                         })
 
         if not transactions:
@@ -114,29 +123,36 @@ async def upload_pdf(file: UploadFile = File(...)):
         return {
             "status": "success",
             "total_transactions": len(transactions),
-            "transactions": transactions # Changed from 'raw_transactions' to 'transactions'
+            "transactions": transactions
         }
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        print(f"Error during PDF upload: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": f"Server error during PDF processing: {str(e)}"}
 
 @app.post("/save-category")
 async def save_category(payload: dict):
-    # Now expecting 'description' for the categorization key from frontend
-    description = payload.get("description") 
+    description = payload.get("description")
     category = payload.get("category")
 
     if not description or not category:
         return {"status": "error", "message": "Missing description or category"}
 
     try:
+        memory = {}
         if os.path.exists(CATEGORIZATION_FILE):
             with open(CATEGORIZATION_FILE, "r") as f:
-                memory = json.load(f)
-        else:
-            memory = {}
+                content = f.read()
+                if content:
+                    try:
+                        memory = json.loads(content)
+                    except json.JSONDecodeError:
+                        print(f"Warning: {CATEGORIZATION_FILE} is corrupted or invalid JSON. Starting with empty memory.")
+                else:
+                    print(f"Info: {CATEGORIZATION_FILE} is empty. Starting with empty memory.")
 
-        # Use description as the key for categorization memory
         memory[description] = category
 
         with open(CATEGORIZATION_FILE, "w") as f:
@@ -145,18 +161,30 @@ async def save_category(payload: dict):
         return {"status": "success"}
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        print(f"Error saving category: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": f"Server error saving category: {str(e)}"}
 
 @app.get("/get-categories")
 async def get_categories():
     try:
+        memory = {}
         if os.path.exists(CATEGORIZATION_FILE):
             with open(CATEGORIZATION_FILE, "r") as f:
-                memory = json.load(f)
-        else:
-            memory = {}
+                content = f.read()
+                if content:
+                    try:
+                        memory = json.loads(content)
+                    except json.JSONDecodeError:
+                        print(f"Warning: {CATEGORIZATION_FILE} is corrupted or invalid JSON. Starting with empty memory.")
+                else:
+                    print(f"Info: {CATEGORIZATION_FILE} is empty. Starting with empty memory.")
 
         return {"status": "success", "memory": memory}
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        print(f"Error getting categories: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": f"Server error getting categories: {str(e)}"}
