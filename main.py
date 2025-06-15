@@ -27,37 +27,26 @@ async def upload_pdf(file: UploadFile = File(...)):
     try:
         reader = PdfReader(file.file)
         transactions = []
-        for page in reader.pages:
+        
+        print(f"--- Processing PDF: {file.filename} ---") # DEBUG PRINT
+
+        for i, page in enumerate(reader.pages):
             text = page.extract_text()
+            
+            print(f"--- Page {i+1} Raw Text ---") # DEBUG PRINT
+            print(text) # DEBUG PRINT: Print the entire raw text extracted from the page
+            print("--- End Page Raw Text ---") # DEBUG PRINT
+
             if text:
                 lines = re.split(r'\r\n|\n|\r', text)
-
-                # UPDATED COMPREHENSIVE REGEX PATTERN:
-                # This pattern assumes:
-                # 1. Start of line, then Transaction Date.
-                # 2. Followed by an optional Value Date (which we'll consume).
-                # 3. Then the Description, which can be multi-word and contain various chars.
-                # 4. Followed by TWO distinct amount columns (Debit and Credit), which might contain '0.00' or be empty/dash.
-                # 5. Finally, the Balance amount at the end of the line.
-                #
-                # Components:
-                # ^\s* : Start of line, optional leading whitespace
-                # (\d{1,2}\s+\w+\s+\d{4}) : Group 1: Transaction Date (e.g., "4 Mar 2025")
-                # \s+ : One or more spaces
-                # (?:\d{1,2}\s+\w+\s+\d{4})? : Non-capturing optional Group for Value Date (e.g., "4 Mar 2025"), consumes it.
-                # \s* : Optional spaces
-                # (.+?) : Group 2: Description (NON-GREEDY, captures everything until it hits a potential amount or ends)
-                # \s{2,} : Two or more spaces (often separates description from amounts reliably)
-                # ([\d,]+\.\d{2}|-)? : Group 3: Debit Amount (e.g., "10,000.00" or "-"), optional.
-                # \s{2,} : Two or more spaces
-                # ([\d,]+\.\d{2}|-)? : Group 4: Credit Amount (e.g., "10,000.00" or "-"), optional.
-                # \s* : Optional spaces
-                # ([\d,]+\.\d{2}|\d[\d,]*|-\s*)?$ : Group 5: Balance (e.g., "1,92,462" or "100.00" or "-"), optional end of line.
-                #
-                # The assumption of '\s+' separating fields is critical. If your PDFs have
-                # fixed-width columns or consistent multiple spaces, you might need '\s{2,}'
-                # or a very specific count of spaces for better accuracy.
                 
+                print(f"--- Page {i+1} Split Lines ({len(lines)} lines) ---") # DEBUG PRINT
+                for j, line in enumerate(lines):
+                    print(f"Line {j}: '{line}'") # DEBUG PRINT: Print each line to see exact spacing/breaks
+                print("--- End Page Split Lines ---") # DEBUG PRINT
+
+
+                # UPDATED COMPREHENSIVE REGEX PATTERN (from previous turn):
                 transaction_line_pattern = re.compile(
                     r"^\s*" + # Start of line, optional leading space
                     r"(\d{1,2}\s+\w+\s+\d{4})" + # Group 1: Transaction Date
@@ -71,51 +60,47 @@ async def upload_pdf(file: UploadFile = File(...)):
                     r"([\d,]+\.\d{2}|\d[\d,]*|-\s*)?" + # Group 5: Balance (can be float, int with commas, or dash), optional
                     r"\s*$" # Optional trailing space and end of line
                 )
-
-
+                
                 # Function to safely parse amount strings to float
                 def parse_amount(amount_str):
                     if amount_str is None or amount_str.strip() == '-' or amount_str.strip() == '':
                         return 0.0
-                    # Handle cases like "1,92,462" by removing commas before converting to float
                     return float(amount_str.replace(',', '')) 
 
                 for line in lines:
                     line = line.strip()
                     if not line:
                         continue
-
+                    
                     match = transaction_line_pattern.search(line)
-
+                    
+                    # DEBUG PRINT: Show if a line is being checked and if it matches
+                    print(f"Checking line: '{line}'")
                     if match:
+                        print(f"MATCH FOUND for line: '{line}'")
+                        print(f"Groups: {match.groups()}")
+
                         trans_date_str = match.group(1)
                         description_raw = match.group(2)
                         debit_str = match.group(3)
                         credit_str = match.group(4)
-                        balance_str = match.group(5) # Note: Balance is now group 5
+                        balance_str = match.group(5)
 
-                        # --- Date Parsing ---
                         extracted_date = None
                         try:
-                            # Try parsing "DD MonYYYY" format
                             extracted_date = datetime.strptime(trans_date_str, '%d %b %Y').strftime('%Y-%m-%d')
                         except ValueError:
-                            # If that fails, try to parse other potential date formats or keep raw
-                            # For example, if your date is "MM/DD/YYYY" or "DD-MM-YYYY"
                             try:
                                 extracted_date = datetime.strptime(trans_date_str, '%m/%d/%Y').strftime('%Y-%m-%d')
                             except ValueError:
                                 try:
                                     extracted_date = datetime.strptime(trans_date_str, '%d-%m-%Y').strftime('%Y-%m-%d')
                                 except ValueError:
-                                    extracted_date = trans_date_str # Fallback to raw string if no known format matches
+                                    extracted_date = trans_date_str
 
-                        # --- Description Cleaning ---
-                        # The regex should capture the full description. This cleans up extra spaces.
                         description = description_raw.strip()
-                        description = re.sub(r'\s+', ' ', description).strip() # Replace multiple spaces with single
+                        description = re.sub(r'\s+', ' ', description).strip()
 
-                        # --- Amount Parsing ---
                         debit = parse_amount(debit_str)
                         credit = parse_amount(credit_str)
                         balance = parse_amount(balance_str)
@@ -126,27 +111,31 @@ async def upload_pdf(file: UploadFile = File(...)):
                             "debit": debit,
                             "credit": credit,
                             "balance": balance,
-                            "original_line": line # Keep original for debugging
+                            "original_line": line
                         })
+                    else:
+                        print(f"NO MATCH for line: '{line}'") # DEBUG PRINT
+
 
         if not transactions:
+            print("INFO: No transactions found after processing all lines.") # DEBUG PRINT
             return {"status": "error", "message": "No transactions found in PDF."}
 
+        print(f"INFO: Successfully extracted {len(transactions)} transactions.") # DEBUG PRINT
         return {
             "status": "success",
             "total_transactions": len(transactions),
-            "transactions": transactions # This is the structured data frontend expects
+            "transactions": transactions
         }
 
     except Exception as e:
-        print(f"Error during PDF upload: {e}")
+        print(f"ERROR: Exception during PDF upload: {e}") # DEBUG PRINT
         import traceback
-        traceback.print_exc() # Print full traceback to logs for debugging
+        traceback.print_exc()
         return {"status": "error", "message": f"Server error during PDF processing: {str(e)}"}
 
 @app.post("/save-category")
 async def save_category(payload: dict):
-    # Now expecting 'description' for the categorization key from frontend
     description = payload.get("description")
     category = payload.get("category")
 
@@ -154,18 +143,15 @@ async def save_category(payload: dict):
         return {"status": "error", "message": "Missing description or category"}
 
     try:
-        memory = {} # Default to empty memory if file not found or corrupted
+        memory = {}
         if os.path.exists(CATEGORIZATION_FILE):
             with open(CATEGORIZATION_FILE, "r") as f:
-                content = f.read() # Read content first
-                if content: # Check if content is not empty
+                content = f.read()
+                if content:
                     try:
-                        memory = json.loads(content) # Use json.loads for string content
+                        memory = json.loads(content)
                     except json.JSONDecodeError:
-                        # Log the error, but proceed with empty memory
                         print(f"Warning: {CATEGORIZATION_FILE} is corrupted or invalid JSON. Starting with empty memory.")
-                        # You might want to delete the file here if it's consistently corrupted:
-                        # os.remove(CATEGORIZATION_FILE)
                 else:
                     print(f"Info: {CATEGORIZATION_FILE} is empty. Starting with empty memory.")
 
@@ -185,13 +171,13 @@ async def save_category(payload: dict):
 @app.get("/get-categories")
 async def get_categories():
     try:
-        memory = {} # Default to empty memory if file not found or corrupted
+        memory = {}
         if os.path.exists(CATEGORIZATION_FILE):
             with open(CATEGORIZATION_FILE, "r") as f:
-                content = f.read() # Read content first
-                if content: # Check if content is not empty
+                content = f.read()
+                if content:
                     try:
-                        memory = json.loads(content) # Use json.loads for string content
+                        memory = json.loads(content)
                     except json.JSONDecodeError:
                         print(f"Warning: {CATEGORIZATION_FILE} is corrupted or invalid JSON. Starting with empty memory.")
                 else:
